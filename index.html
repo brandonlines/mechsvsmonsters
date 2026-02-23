@@ -569,6 +569,7 @@
         <div class="control-item"><span class="key">W A S D</span><span class="control-desc">Move Mech</span></div>
         <div class="control-item"><span class="key">MOUSE</span><span class="control-desc">Aim weapons</span></div>
         <div class="control-item"><span class="key">LEFT CLICK</span><span class="control-desc">Fire cannon</span></div>
+        <div class="control-item"><span class="key">F / RIGHT CLICK</span><span class="control-desc">Melee slash</span></div>
         <div class="control-item"><span class="key">SPACE</span><span class="control-desc">Nova Bomb (charged)</span></div>
         <div class="control-item"><span class="key">SHIFT</span><span class="control-desc">Sprint [unlocks W2]</span></div>
         <div class="control-item"><span class="key">J</span><span class="control-desc">Fly 5s [unlocks W3]</span></div>
@@ -578,7 +579,7 @@
 
       <div id="final-score" style="display:none"></div>
       <button class="btn" id="start-btn">DEPLOY MECH</button>
-      <div id="controls-hint">SURVIVE THE WAVES · BEAT EACH LEVEL TO UNLOCK NEW ABILITIES</div>
+      <div id="controls-hint">SURVIVE THE WAVES · PICK UP REGEN CORES · DEFEAT THE WAVE 5 BOSS</div>
     </div>
 
     <!-- UNLOCK OVERLAY (between waves) -->
@@ -678,21 +679,33 @@ canvas.addEventListener('mousemove', e => {
   mouse.x = e.clientX - r.left;
   mouse.y = e.clientY - r.top;
 });
-canvas.addEventListener('mousedown', e => { if(e.button===0) mouseDown = true; });
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('mousedown', e => {
+  if(e.button===0) mouseDown = true;
+  if(e.button===2) attemptMelee();
+});
 canvas.addEventListener('mouseup', e => { if(e.button===0) mouseDown = false; });
 document.addEventListener('keydown', e => {
   keys[e.code] = true;
-  if(['Space','KeyJ','KeyK','ShiftLeft','ShiftRight','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+  if(['Space','KeyF','KeyJ','KeyK','ShiftLeft','ShiftRight','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
 });
 document.addEventListener('keyup', e => { keys[e.code] = false; });
 
 // ---- Entities & ability state ----
-let player, bullets, monsters, particles, floatTexts, nukeBlasts;
+let player, bullets, monsters, particles, floatTexts, nukeBlasts, pickups;
 let shootCooldown = 0;
 let waveState = 'fighting';
 let spawnQueue = [];
 let spawnTimer = 0;
 let specialCharge = 0;
+let meleeCooldown = 0;
+let meleeArcTimer = 0;
+let meleeAngle = 0;
+const MELEE_COOLDOWN = 28;
+const MELEE_RANGE = 90;
+let regenTicks = 0;
+const REGEN_TICK_HEAL = 0.18;
+let wave5BossSpawned = false;
 
 // Unlocks
 let unlocked = {};
@@ -718,9 +731,13 @@ function initGame() {
   sprintHeat = 0;
   flyTimer = 0; flyActive = false; flyCooldown = 0;
   nukeBombs = 0;
+  regenTicks = 0;
+  wave5BossSpawned = false;
+  meleeCooldown = 0;
+  meleeArcTimer = 0;
 
   player = { x: W/2, y: H/2, hp: 100, maxHp: 100, r: 22, speed: 3.2, angle: 0, invincible: 0 };
-  bullets = []; monsters = []; particles = []; floatTexts = []; nukeBlasts = [];
+  bullets = []; monsters = []; particles = []; floatTexts = []; nukeBlasts = []; pickups = [];
   shootCooldown = 0;
   waveState = 'announcing';
   waveTimer = 90;
@@ -766,16 +783,21 @@ function spawnMonster(type) {
     fast:  { r:11, hp:15, speed:2.4, color:'#ff4400', accentColor:'#ff8844', score:15, dmg:8 },
     tank:  { r:26, hp:100, speed:0.7, color:'#00aa44', accentColor:'#44ff88', score:30, dmg:20 },
     brute: { r:36, hp:200, speed:0.5, color:'#cc0000', accentColor:'#ff4400', score:60, dmg:35 },
+    boss:  { r:52, hp:2200, speed:0.45, color:'#3d0000', accentColor:'#ff2200', score:900, dmg:45 },
   };
   const t = types[type] || types.basic;
+  if(type === 'boss') {
+    x = W / 2;
+    y = -80;
+  }
   monsters.push({ x, y, type, ...t, maxHp: t.hp, angle: 0, wobble: Math.random()*Math.PI*2 });
 }
 
 // ---- HUD ----
-function announceWave(w) {
-  waveAnnounce.textContent = `WAVE ${w}`;
+function announceWave(label, danger=false) {
+  waveAnnounce.textContent = typeof label === 'number' ? `WAVE ${label}` : String(label);
   waveAnnounce.style.opacity = '1';
-  waveAnnounce.style.color = w > 3 ? '#ff0040' : '#00f5ff';
+  waveAnnounce.style.color = danger || (typeof label === 'number' && label > 3) ? '#ff0040' : '#00f5ff';
   setTimeout(() => waveAnnounce.style.opacity = '0', 2000);
 }
 
@@ -902,10 +924,74 @@ function launchNuke() {
   addFloat(player.x, player.y-50, `☢️ NUKE AWAY! (${nukeBombs} left)`, '#cc44ff');
 }
 
+function attemptMelee() {
+  if(state !== 'playing') return;
+  if(!(waveState === 'fighting' || waveState === 'boss')) return;
+  if(meleeCooldown > 0) return;
+
+  meleeCooldown = MELEE_COOLDOWN;
+  meleeArcTimer = 10;
+  meleeAngle = player.angle;
+
+  const dmg = unlocked.doubleDamage ? 90 : 45;
+  let hits = 0;
+  for(let i=monsters.length-1;i>=0;i--){
+    const m = monsters[i];
+    const dx = m.x - player.x;
+    const dy = m.y - player.y;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    if(dist > MELEE_RANGE + m.r) continue;
+    const a = Math.atan2(dy, dx);
+    const delta = Math.atan2(Math.sin(a - meleeAngle), Math.cos(a - meleeAngle));
+    if(Math.abs(delta) > Math.PI * 0.6) continue;
+
+    m.hp -= dmg;
+    const kb = m.type === 'boss' ? 4 : 10;
+    if(dist > 0) {
+      m.x += (dx / dist) * kb;
+      m.y += (dy / dist) * kb;
+    }
+    spawnHitParticles(m.x, m.y, '#ffee00');
+    if(m.hp <= 0) killMonster(m, i);
+    hits++;
+  }
+
+  if(hits > 0) {
+    specialCharge = Math.min(100, specialCharge + hits * 6);
+    addFloat(player.x, player.y-36, `MELEE x${hits}`, '#ffee00');
+  } else {
+    addFloat(player.x, player.y-36, 'MISS', '#8899aa');
+  }
+}
+
+function spawnHealthDrop(m) {
+  const chanceMap = { basic:0.12, fast:0.16, tank:0.32, brute:0.45, boss:1.0 };
+  const chance = chanceMap[m.type] || 0.1;
+  if(Math.random() > chance) return;
+  pickups.push({
+    x: m.x,
+    y: m.y,
+    r: m.type === 'boss' ? 16 : 12,
+    life: 900,
+    pulse: Math.random() * Math.PI * 2,
+    heal: m.type === 'boss' ? 60 : 25,
+    regen: m.type === 'boss' ? 480 : 300
+  });
+}
+
+function startWave5Boss() {
+  wave5BossSpawned = true;
+  waveState = 'boss';
+  spawnMonster('boss');
+  announceWave('BOSS: TITAN PRIME', true);
+  addFloat(W/2, H/2 - 80, 'WARNING: TITAN PRIME DEPLOYED', '#ff2200');
+}
+
 // ---- Update ----
 let jPressed = false;
 let kPressed = false;
 let spacePressed = false;
+let fPressed = false;
 
 function update() {
   if(state !== 'playing') return;
@@ -934,12 +1020,19 @@ function update() {
 
   // ---- Shooting ----
   shootCooldown=Math.max(0,shootCooldown-1);
-  if(mouseDown && shootCooldown<=0 && waveState==='fighting') {
+  const inCombat = waveState==='fighting' || waveState==='boss';
+  if(mouseDown && shootCooldown<=0 && inCombat) {
     fireBullet(); shootCooldown=8;
   }
 
+  // ---- Melee ----
+  if(keys['KeyF'] && !fPressed) attemptMelee();
+  fPressed = keys['KeyF'];
+  if(meleeCooldown>0) meleeCooldown--;
+  if(meleeArcTimer>0) meleeArcTimer--;
+
   // ---- Nova ----
-  if(keys['Space'] && !spacePressed && specialCharge>=100) { novaBlast(); }
+  if(inCombat && keys['Space'] && !spacePressed && specialCharge>=100) { novaBlast(); }
   spacePressed = keys['Space'];
 
   // ---- Fly ----
@@ -952,7 +1045,7 @@ function update() {
   if(flyCooldown>0) flyCooldown--;
 
   // ---- Nuke ----
-  if(keys['KeyK'] && !kPressed) launchNuke();
+  if(inCombat && keys['KeyK'] && !kPressed) launchNuke();
   kPressed = keys['KeyK'];
 
   // ---- Wave logic ----
@@ -1009,6 +1102,29 @@ function update() {
 
   if(player.invincible>0) player.invincible--;
 
+  // ---- Health pickups & regeneration ----
+  if(regenTicks>0){
+    regenTicks--;
+    player.hp = Math.min(player.maxHp, player.hp + REGEN_TICK_HEAL);
+  }
+  for(let i=pickups.length-1;i>=0;i--){
+    const p = pickups[i];
+    p.life--;
+    p.pulse += 0.12;
+    if(p.life<=0){ pickups.splice(i,1); continue; }
+    const d = Math.hypot(player.x-p.x, player.y-p.y);
+    if(d < player.r + p.r){
+      player.hp = Math.min(player.maxHp, player.hp + p.heal);
+      regenTicks = Math.max(regenTicks, p.regen);
+      addFloat(p.x, p.y-22, `+${p.heal} HP · REGEN`, '#00ff88');
+      for(let n=0;n<12;n++){
+        const a=Math.random()*Math.PI*2, spd=1+Math.random()*3;
+        particles.push({x:p.x,y:p.y,vx:Math.cos(a)*spd,vy:Math.sin(a)*spd,r:2+Math.random()*2,life:24,maxLife:24,color:'#00ff88'});
+      }
+      pickups.splice(i,1);
+    }
+  }
+
   // ---- Nuke blasts ----
   for(let i=nukeBlasts.length-1;i>=0;i--){
     const nb=nukeBlasts[i];
@@ -1052,11 +1168,15 @@ function update() {
   floatTexts=floatTexts.filter(t=>{ t.y+=t.vy; t.life--; return t.life>0; });
 
   // ---- Wave clear check ----
-  if(waveState==='fighting' && monsters.length===0 && spawnQueue.length===0){
-    waveState='clearing';
-    waveTimer=60;
-    score+=wave*100;
-    addFloat(W/2,H/2-60,`WAVE ${wave} CLEAR! +${wave*100}`,'#00f5ff');
+  if((waveState==='fighting' || waveState==='boss') && monsters.length===0 && spawnQueue.length===0){
+    if(wave===5 && !wave5BossSpawned){
+      startWave5Boss();
+    } else {
+      waveState='clearing';
+      waveTimer=60;
+      score+=wave*100;
+      addFloat(W/2,H/2-60,`WAVE ${wave} CLEAR! +${wave*100}`,'#00f5ff');
+    }
   }
   if(waveState==='clearing'){
     waveTimer--;
@@ -1076,12 +1196,19 @@ function update() {
 
 function killMonster(m, i) {
   spawnDeathParticles(m);
-  score += m.score * wave;
+  score += m.score * (m.type === 'boss' ? 1 : wave);
   kills++;
-  specialCharge = Math.min(100, specialCharge+(m.type==='brute'?25:m.type==='tank'?15:m.type==='fast'?8:5));
-  const msgs={basic:'MONSTER DOWN',fast:`FAST KILL +${m.score*wave}`,tank:`TANK DESTROYED +${m.score*wave}`,brute:`BRUTE SLAIN! +${m.score*wave}`};
+  specialCharge = Math.min(100, specialCharge+(m.type==='boss'?40:m.type==='brute'?25:m.type==='tank'?15:m.type==='fast'?8:5));
+  const msgs={
+    basic:'MONSTER DOWN',
+    fast:`FAST KILL +${m.score*wave}`,
+    tank:`TANK DESTROYED +${m.score*wave}`,
+    brute:`BRUTE SLAIN! +${m.score*wave}`,
+    boss:'BOSS CORE BREACHED! +900'
+  };
   addKillMsg(msgs[m.type]);
-  addFloat(m.x, m.y-20, '+'+m.score*wave, m.accentColor);
+  addFloat(m.x, m.y-20, '+' + (m.score * (m.type === 'boss' ? 1 : wave)), m.accentColor);
+  spawnHealthDrop(m);
   if(i>=0 && i<monsters.length) monsters.splice(i,1);
 }
 
@@ -1118,6 +1245,7 @@ function advanceWave() {
   waveTimer=90;
   spawnQueue=buildWave(wave);
   spawnTimer=0;
+  player.hp = player.maxHp;
   announceWave(wave);
   updateHUD();
 }
@@ -1250,6 +1378,22 @@ function drawMonster(m) {
     ctx.beginPath();ctx.arc(10,-6,3,0,Math.PI*2);ctx.fill();
     ctx.strokeStyle='#ff4400'; ctx.lineWidth=3;
     ctx.beginPath();ctx.arc(0,6,12,0,Math.PI);ctx.stroke();
+
+  } else if(m.type==='boss'){
+    ctx.fillStyle=m.color; ctx.strokeStyle=m.accentColor; ctx.lineWidth=5;
+    ctx.beginPath(); ctx.arc(0,0,m.r,0,Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.strokeStyle='rgba(255,140,0,0.9)'; ctx.lineWidth=3;
+    for(let i=0;i<6;i++){
+      const a=m.wobble+i*Math.PI/3;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a)*(m.r-12), Math.sin(a)*(m.r-12));
+      ctx.lineTo(Math.cos(a)*(m.r+18), Math.sin(a)*(m.r+18));
+      ctx.stroke();
+    }
+    ctx.fillStyle='#ff2200'; ctx.shadowColor='#ff2200'; ctx.shadowBlur=25;
+    ctx.beginPath(); ctx.arc(0,0,14+Math.sin(m.wobble*2)*2,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#ffee88';
+    ctx.beginPath(); ctx.arc(0,0,6,0,Math.PI*2); ctx.fill();
   }
 
   // HP bar
@@ -1271,6 +1415,25 @@ function drawBullet(b) {
   ctx.fillStyle='#ffffff'; ctx.beginPath(); ctx.arc(b.x,b.y,b.r*0.5,0,Math.PI*2); ctx.fill();
   ctx.fillStyle=b.color; ctx.beginPath(); ctx.arc(b.x,b.y,b.r,0,Math.PI*2); ctx.fill();
   ctx.shadowBlur=0; ctx.restore();
+}
+
+function drawPickups() {
+  for(const p of pickups){
+    ctx.save();
+    const glow = 0.75 + Math.sin(p.pulse) * 0.25;
+    ctx.globalAlpha = glow;
+    ctx.shadowColor = '#00ff88';
+    ctx.shadowBlur = 18;
+    ctx.fillStyle = 'rgba(0,255,136,0.25)';
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r + 5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#00ff88';
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    ctx.strokeStyle = '#c8ffe8';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(p.x - 5, p.y); ctx.lineTo(p.x + 5, p.y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(p.x, p.y - 5); ctx.lineTo(p.x, p.y + 5); ctx.stroke();
+    ctx.restore();
+  }
 }
 
 function drawNukeBlasts() {
@@ -1394,9 +1557,24 @@ function draw() {
 
   drawParticles();
   drawNukeBlasts();
+  drawPickups();
   for(const b of bullets) drawBullet(b);
   for(const m of monsters) drawMonster(m);
   if(player) drawMech(player.x, player.y, player.angle, player.invincible);
+
+  if(player && meleeArcTimer>0){
+    const arcAlpha = meleeArcTimer / 10;
+    ctx.save();
+    ctx.globalAlpha = arcAlpha;
+    ctx.strokeStyle = '#ffee00';
+    ctx.lineWidth = 5;
+    ctx.shadowColor = '#ffee00';
+    ctx.shadowBlur = 18;
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, MELEE_RANGE, meleeAngle - Math.PI * 0.6, meleeAngle + Math.PI * 0.6);
+    ctx.stroke();
+    ctx.restore();
+  }
   drawStatusIndicators();
   drawFloatTexts();
   drawCrosshair();
